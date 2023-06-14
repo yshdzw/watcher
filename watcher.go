@@ -3,7 +3,7 @@ package watcher
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -43,6 +43,7 @@ const (
 	Rename
 	Chmod
 	Move
+	Unknown Op = math.MaxUint32
 )
 
 var ops = map[Op]string{
@@ -240,7 +241,7 @@ func (w *Watcher) list(name string) (map[string]os.FileInfo, error) {
 	}
 
 	// It's a directory.
-	fInfoList, err := ioutil.ReadDir(name)
+	entryList, err := os.ReadDir(name)
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +249,12 @@ func (w *Watcher) list(name string) (map[string]os.FileInfo, error) {
 	// as they aren't on the ignored list or are hidden files if ignoreHidden
 	// is set to true.
 outer:
-	for _, fInfo := range fInfoList {
+	for _, entry := range entryList {
+		fInfo, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+
 		path := filepath.Join(name, fInfo.Name())
 		_, ignored := w.ignored[path]
 
@@ -551,10 +557,6 @@ func (w *Watcher) Start(d time.Duration) error {
 	w.wg.Done()
 
 	for {
-		// done lets the inner polling cycle loop know when the
-		// current cycle's method has finished executing.
-		done := make(chan struct{})
-
 		// Any events that are found are first piped to evt before
 		// being sent to the main Event channel.
 		evt := make(chan Event)
@@ -568,7 +570,6 @@ func (w *Watcher) Start(d time.Duration) error {
 		// Look for events.
 		go func() {
 			w.pollEvents(fileList, evt, cancel)
-			done <- struct{}{}
 		}()
 
 		// numEvents holds the number of events for the current cycle.
@@ -582,6 +583,10 @@ func (w *Watcher) Start(d time.Duration) error {
 				close(w.Closed)
 				return nil
 			case event := <-evt:
+				if event.Op == Unknown { // Current cycle is finished.
+					break inner
+				}
+
 				if len(w.ops) > 0 { // Filter Ops.
 					_, found := w.ops[event.Op]
 					if !found {
@@ -594,8 +599,6 @@ func (w *Watcher) Start(d time.Duration) error {
 					break inner
 				}
 				w.Event <- event
-			case <-done: // Current cycle is finished.
-				break inner
 			}
 		}
 
@@ -613,6 +616,11 @@ func (w *Watcher) pollEvents(files map[string]os.FileInfo, evt chan Event,
 	cancel chan struct{}) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	// Stop the current polling cycle loop.
+	defer func() {
+		evt <- Event{Op: Unknown}
+	}()
 
 	// Store create and remove events for use to check for rename events.
 	creates := make(map[string]os.FileInfo)
